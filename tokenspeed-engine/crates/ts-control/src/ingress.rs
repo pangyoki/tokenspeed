@@ -103,20 +103,22 @@ impl LogprobServability {
                     .to_owned(),
             );
         }
-        if has_multimodal_inputs {
-            return Some(
-                "logprob_start_len >= 0 (prompt logprobs) is not supported for multimodal \
-                 prompts; use logprob_start_len=-1."
-                    .to_owned(),
-            );
-        }
+        // Multimodal scoring is valid when canonical, in-vocabulary image
+        // placeholders are supplied. A placeholder's target score is not a VQ
+        // likelihood; callers mask it while retaining this row's real TopK.
+        // Content-derived cache IDs remain outside the scoring vocabulary.
         let outside = input_ids
             .iter()
             .any(|&id| id < 0 || i64::from(id) >= vocab_size);
         outside.then(|| {
             format!(
                 "prompt logprobs need every prompt token id inside the vocabulary \
-                 [0, {vocab_size}); input_ids contains one outside it."
+                 [0, {vocab_size}); input_ids contains one outside it. {}",
+                if has_multimodal_inputs {
+                    "Multimodal prompt scores require canonical image placeholders."
+                } else {
+                    ""
+                }
             )
         })
     }
@@ -976,6 +978,17 @@ mod tests {
             refused_message(admit(prompt("f", vec![1, 2]), &lm_head_tp).unwrap())
                 .contains("--lm-head-tp-size")
         );
+    }
+
+    #[test]
+    fn canonical_multimodal_targets_can_be_scored_but_hash_ids_cannot() {
+        let serving = limits().logprobs;
+        assert!(serving.prompt_logprobs_refusal(&[1, 223, 221, 222], true, 5000).is_none());
+        assert!(serving.prompt_logprobs_refusal(&[1, 223, 1000000, 222], true, 5000)
+            .unwrap().contains("canonical image placeholders"));
+        assert!(serving.prompt_logprobs_refusal(&[1, -1], false, 5000)
+            .unwrap().contains("inside the vocabulary"));
+        assert!(serving.top_logprobs_refusal(1, Some(32)).unwrap().contains("max_new_tokens <= 1"));
     }
 
     #[test]

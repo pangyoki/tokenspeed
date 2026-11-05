@@ -400,6 +400,11 @@ class MultimodalEmbedder:
         input_embeds, kwargs = self._assemble(
             input_ids, text_embedding, plan, encoders, multimodal_model
         )
+        # A model may observe the actual scatter before completed items release
+        # their encoded tensors. The hook is diagnostic and returns no values.
+        observer = getattr(multimodal_model, "observe_multimodal_embeddings", None)
+        if observer is not None:
+            observer(input_embeds, ctx, plan)
         assemble_elapsed_ms = (
             (time.perf_counter() - assemble_started) * 1000
             if assemble_started is not None
