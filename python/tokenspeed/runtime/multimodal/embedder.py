@@ -132,6 +132,8 @@ class EncoderSpec:
     fn: EncoderFn
     deepstack: bool = False
     make_warmup_items: EncoderWarmupItemsFactory | None = None
+    # Optional scalar snapshot sampled on the model's owner thread.
+    cache_stats: Callable[[], dict[str, int]] | None = None
 
 
 def warmup_multimodal_encoders(

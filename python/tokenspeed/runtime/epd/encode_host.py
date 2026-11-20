@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import faulthandler
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
@@ -62,6 +63,9 @@ from tokenspeed.runtime.engine.gc_hooks import (
 )
 from tokenspeed.runtime.engine.io_struct import MsgpackDecoder
 from tokenspeed.runtime.epd.encode_worker import EncodeRequest
+from tokenspeed.runtime.metrics.config import metrics_enabled
+from tokenspeed.runtime.metrics.encoder import EncoderCacheMetrics
+from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.multimodal.embedder import _item_token_count
 from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
 from tokenspeed.runtime.pd.host_peer import (
@@ -271,6 +275,11 @@ class EncodeSettings:
     ring_deepstack_base: int
     max_batch_tokens: int
     max_batch_items: int
+    metrics_enabled: bool
+    metrics_prometheus_dir: str | None
+    metrics_relay_endpoint: str | None
+    metrics_model_name: str
+    metrics_app_key: str
 
 
 class EncodeDataPlane:
@@ -282,8 +291,17 @@ class EncodeDataPlane:
     """
 
     def __init__(
-        self, *, model, cache, ring: SendRing, device: Any, tp_cpu_group
+        self,
+        *,
+        model,
+        cache,
+        ring: SendRing,
+        device: Any,
+        tp_cpu_group,
+        cache_metrics: EncoderCacheMetrics | None = None,
     ) -> None:
+        self._cache_metrics = cache_metrics
+        self._cache_warning = False
         self._model = model
         self._cache = cache
         self._ring = ring
@@ -301,12 +319,32 @@ class EncodeDataPlane:
         self._lock = threading.Lock()
         self._gc_hooks = GcHooks(full_collection_interval=FULL_COLLECTION_INTERVAL)
 
+    def _sample_cache(self) -> None:
+        if self._cache_metrics is None:
+            return
+        try:
+            snapshots = {}
+            callbacks = {
+                spec.cache_stats
+                for spec in self._model.get_multimodal_encoder_specs().values()
+                if spec.cache_stats is not None
+            }
+            for callback in callbacks:
+                for key, value in callback().items():
+                    snapshots[key] = snapshots.get(key, 0) + value
+            self._cache_metrics.record(snapshots)
+        except Exception:
+            if not self._cache_warning:
+                logger.warning("encoder cache metrics unavailable", exc_info=True)
+                self._cache_warning = True
+
     def enter_forward_thread(self) -> None:
         """Called once by the host's forward thread, before its first
         operation."""
         threading.current_thread().name = "tokenspeed::forward"
         if self._device.type in ("cuda", "npu"):
             torch.get_device_module(self._device.type).set_device(self._device)
+        self._sample_cache()
 
     def admit(self, requests: list[tuple[int, list[bytes]]]) -> list[bool]:
         """Take encode requests ``(admission, wire frames)``; say for each
@@ -417,6 +455,7 @@ class EncodeDataPlane:
             self._copies.append((event, outcomes))
         # Every rank embeds the same batches, so the ranks collect in the
         # same one.
+        self._sample_cache()
         self._gc_hooks.note_round(forwarded=True)
 
     def encoded(self) -> list[tuple]:
@@ -452,7 +491,11 @@ class EncodeBootstrap:
     mode = "encode"
 
     def __init__(
-        self, server_args: ServerArgs, port_args: PortArgs, connection: Connection
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        connection: Connection,
+        metrics_relay_endpoint: str | None,
     ) -> None:
         from tokenspeed.runtime.configs.model_config import ModelConfig
         from tokenspeed.runtime.distributed.process_group_manager import (
@@ -580,7 +623,29 @@ class EncodeBootstrap:
             ring_deepstack_base=regions[1][0] if len(regions) > 1 else 0,
             max_batch_tokens=server_args.chunked_prefill_size or 8192,
             max_batch_items=server_args.max_num_seqs,
+            metrics_enabled=server_args.enable_metrics,
+            metrics_prometheus_dir=(
+                os.environ["PROMETHEUS_MULTIPROC_DIR"]
+                if metrics_enabled(server_args, "prometheus")
+                else None
+            ),
+            metrics_relay_endpoint=metrics_relay_endpoint,
+            metrics_model_name=server_args.served_model_name,
+            metrics_app_key=server_args.app_key or "",
         )
+        cache_metrics = None
+        if server_args.enable_metrics and first:
+            metrics_service.connect(port_args.metrics_producer_configs)
+            cache_metrics = EncoderCacheMetrics(
+                labels={
+                    "model_name": server_args.served_model_name,
+                    "app_key": server_args.app_key or "",
+                    "dp_rank": "0",
+                },
+                enabled=True,
+                reporters=server_args.metrics_reporters or ["prometheus"],
+                event_sink=metrics_service.get_event_sink(),
+            )
         #: The data plane the host's threads call.
         self.data_plane = EncodeDataPlane(
             model=model,
@@ -588,6 +653,7 @@ class EncodeBootstrap:
             ring=ring,
             device=device,
             tp_cpu_group=tp_cpu_group,
+            cache_metrics=cache_metrics,
         )
 
     def collective_addresses(self, port: int) -> list[str]:
